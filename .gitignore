@@ -1,0 +1,29 @@
+# Connexion PostgreSQL (hôte, utilisateur, mot de passe)
+pg_service.conf
+.pgpass
+pgpass.conf
+
+# Fichiers de travail QGIS
+*.qgz~
+*.qgs~
+*.qgd
+.qgis-backup/
+
+# Exports de données (récupérables par WFS ou régénérés par le script)
+*.gpkg
+*.gpkg-shm
+*.gpkg-wal
+*.csv
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.qmd
+
+# Système / éditeurs
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
