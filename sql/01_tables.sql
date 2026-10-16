@@ -16,11 +16,22 @@
 --   PostGIS dans public (QGIS génère du SQL non préfixé) :
 --     CREATE EXTENSION IF NOT EXISTS postgis SCHEMA public;
 --
--- HORS DDL — tables brutes importées depuis QGIS (WFS Géoplateforme,
--- emprise courante, EPSG:2154, géométries simples), avec leurs
--- attributs d'origine. Elles ne sont que lues par le script.
---   · parcellaire.rpg_import      : RPG 2025, parcelles graphiques
---   · referentiel.communes_import : communes Admin Express
+-- HORS DDL — tables brutes importées depuis QGIS (Gestionnaire BD,
+-- EPSG:2154), avec leurs attributs d'origine. Elles ne sont que lues
+-- par le script.
+--   · parcellaire.rpg_import          : RPG 2025, parcelles graphiques
+--       (WFS Géoplateforme, emprise courante) — champs utilisés :
+--       code_cultu, geom (MultiPolygon : le script garde
+--       le plus grand polygone)
+--   · referentiel.communes_import     : communes Admin Express
+--       (WFS Géoplateforme) — champs utilisés : code_insee,
+--       nom_officiel, geom
+--   · referentiel.cultures_rpg_import : nomenclature des codes
+--       cultures du RPG (CSV, sans géométrie) — champs utilisés :
+--       code_culture, libelle_culture
+--   · referentiel.lieux_dits_import   : lieux-dits BD TOPO (points,
+--       WFS Géoplateforme), tous types confondus — champs utilisés :
+--       toponyme, geom
 --
 -- PARAMÈTRES (en tête de 02_generation.sql)
 --   CREATE TEMP TABLE param AS
@@ -101,10 +112,11 @@ ALTER TABLE referentiel.exploitation ENABLE ROW LEVEL SECURITY;
 --   toujours renseignée par le script)
 -- · num_ilot     : ST_ClusterDBSCAN par exploitation
 -- · num_parcelle : 1 à n dans l'îlot, plus grande parcelle d'abord
--- · libelle      : lieu-dit où se trouve la parcelle, utilisé une
---   seule fois par exploitation (plus grande parcelle) ; les autres
---   parcelles reçoivent un nom généré (série 1 + complément série 2
---   une fois sur deux), sans doublon dans l'exploitation
+-- · libelle      : lieu-dit BD TOPO le plus proche (rayon max en
+--   paramètre), utilisé une seule fois par exploitation (parcelle la
+--   plus proche du point) ; les autres parcelles reçoivent un nom
+--   généré (série 1 + complément série 2 une fois sur deux), sans
+--   doublon dans l'exploitation
 -- · culture      : culture déclarée au RPG ; culture_n1 / culture_n2
 --   tirées d'une rotation qui la contient (libellés)
 -- · id_logiciel_interne : identifiant fictif d'un logiciel de suivi
