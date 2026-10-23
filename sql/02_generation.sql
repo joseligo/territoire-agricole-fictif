@@ -27,6 +27,7 @@
 --   1. Chargement des îlots et des parcelles
 --   2. Exploitations : surfaces cibles, attribution des îlots,
 --      numérotation des îlots et des parcelles
+--   3. Exploitations : noms et commune du siège
 --   … (étapes suivantes à venir)
 -- =====================================================================
 
@@ -42,6 +43,11 @@ SELECT 25   AS nb_exploitations,
        20   AS surface_min,       -- ha
        240  AS surface_max,       -- ha
        112  AS surface_moy,       -- ha
+       -- forme des parcellaires (étape 2c)
+       2.0  AS hasard_distance,   -- distance × 1 à (1 + valeur) : 0 = blocs ronds
+       0.15 AS part_satellites,   -- part des îlots pris à distance (0 à 1)
+       750  AS satellite_min,     -- m, distance mini au parcellaire
+       3000 AS satellite_max,     -- m, distance maxi au parcellaire
        4    AS nb_depots,
        2026 AS campagne;          -- culture N = RPG 2025 (décalage assumé)
 
@@ -130,7 +136,6 @@ FROM (
 WHERE s.num_ilot_rpg = i.num_ilot_rpg;
 
 
-
 -- ---------------------------------------------------------------------
 -- 2a. EXPLOITATIONS — code et surface cible
 -- · code_expl : 'EXPL' + 5 chiffres tirés au hasard, sans doublon
@@ -148,7 +153,7 @@ CREATE TABLE travail.exploitations (
 	graine        text,                         -- îlot de départ (2b)
 	graine_geom   public.geometry(point, 2154)
 );
- 
+
 WITH p AS (
   SELECT nb_exploitations AS n,
          surface_min::numeric AS a,
@@ -182,8 +187,8 @@ INSERT INTO travail.exploitations (num, code_expl, surface_cible)
 SELECT b.num, b.code_expl,
        round(greatest(p.a, least(p.b, b.s * p.moy / avg(b.s) OVER ())), 2)
 FROM brut b CROSS JOIN p;
- 
- 
+
+
 -- ---------------------------------------------------------------------
 -- 2b. GRAINES — un îlot de départ par exploitation, bien réparties
 -- K-means sur les centres des îlots (k = nb_exploitations) ; la graine
@@ -212,57 +217,86 @@ SET graine = g.num_ilot_rpg,
     graine_geom = g.pt
 FROM graines g
 WHERE g.k = e.num;
- 
+
 -- La graine appartient à son exploitation
 UPDATE travail.ilots i
 SET num_expl = e.num
 FROM travail.exploitations e
 WHERE e.graine = i.num_ilot_rpg;
- 
+
 UPDATE travail.exploitations e
 SET surface = i.surface
 FROM travail.ilots i
 WHERE i.num_ilot_rpg = e.graine;
- 
- 
+
+
 -- ---------------------------------------------------------------------
--- 2c. CROISSANCE — chaque exploitation prend, tour à tour, l'îlot libre
--- le plus proche de sa graine (distance × 1 à 1,5 au hasard, pour des
--- parcellaires moins circulaires), jusqu'à sa surface cible.
+-- 2c. CROISSANCE — chaque exploitation prend, tour à tour, un îlot libre
+-- jusqu'à sa surface cible :
+-- · en général : l'îlot le plus proche de son parcellaire ACTUEL (et non
+--   de sa graine), distance × 1 à (1 + hasard_distance) au hasard
+--   → croissance par le bord, formes allongées et irrégulières
+-- · une fois sur part_satellites : un îlot pris au hasard entre
+--   satellite_min et satellite_max du parcellaire (reprise, location)
+--   → quelques îlots isolés, comme dans la réalité
 -- Un îlot n'est pris que s'il fait moins dépasser la cible qu'il ne
 -- manquerait sans lui (règle de la demi-surface).
 -- ---------------------------------------------------------------------
 DO $$
 DECLARE
-  e    record;
-  ilot record;
+  p       record;
+  e       record;
+  possede public.geometry;
+  v_id    text;
+  v_surf  numeric;
 BEGIN
+  SELECT * INTO p FROM travail.param;
+
   LOOP
     EXIT WHEN NOT EXISTS (SELECT 1 FROM travail.exploitations WHERE NOT complet);
- 
+
     FOR e IN
       SELECT * FROM travail.exploitations WHERE NOT complet ORDER BY random()
     LOOP
-      SELECT i.num_ilot_rpg, i.surface INTO ilot
-      FROM travail.ilots i
-      WHERE i.num_expl IS NULL
-      ORDER BY ST_Distance(i.geom, e.graine_geom) * (1 + random() * 0.5)
-      LIMIT 1;
- 
-      IF ilot.num_ilot_rpg IS NULL
-         OR e.surface + ilot.surface / 2 > e.surface_cible THEN
+      SELECT ST_Collect(geom) INTO possede
+      FROM travail.ilots
+      WHERE num_expl = e.num;
+
+      v_id := NULL;
+
+      -- îlot satellite
+      IF random() < p.part_satellites THEN
+        SELECT i.num_ilot_rpg, i.surface INTO v_id, v_surf
+        FROM travail.ilots i
+        WHERE i.num_expl IS NULL
+          AND e.surface + i.surface / 2 <= e.surface_cible
+          AND ST_DWithin(i.geom, possede, p.satellite_max)
+          AND NOT ST_DWithin(i.geom, possede, p.satellite_min)
+        ORDER BY random()
+        LIMIT 1;
+      END IF;
+
+      -- sinon, îlot voisin du parcellaire
+      IF v_id IS NULL THEN
+        SELECT i.num_ilot_rpg, i.surface INTO v_id, v_surf
+        FROM travail.ilots i
+        WHERE i.num_expl IS NULL
+          AND ST_DWithin(i.geom, possede, p.satellite_max)
+        ORDER BY ST_Distance(i.geom, possede) * (1 + random() * p.hasard_distance)
+        LIMIT 1;
+      END IF;
+
+      IF v_id IS NULL OR e.surface + v_surf / 2 > e.surface_cible THEN
         UPDATE travail.exploitations SET complet = true WHERE num = e.num;
       ELSE
-        UPDATE travail.ilots SET num_expl = e.num
-        WHERE num_ilot_rpg = ilot.num_ilot_rpg;
-        UPDATE travail.exploitations SET surface = surface + ilot.surface
-        WHERE num = e.num;
+        UPDATE travail.ilots SET num_expl = e.num WHERE num_ilot_rpg = v_id;
+        UPDATE travail.exploitations SET surface = surface + v_surf WHERE num = e.num;
       END IF;
     END LOOP;
   END LOOP;
 END $$;
- 
- 
+
+
 -- ---------------------------------------------------------------------
 -- 2d. NUMÉROTATION
 -- · îlots : 1 à n par exploitation, plus grand d'abord
@@ -281,14 +315,14 @@ UPDATE travail.ilots i
 SET num_ilot = n.num
 FROM n
 WHERE n.num_ilot_rpg = i.num_ilot_rpg;
- 
+
 UPDATE travail.parcelles p
 SET code_expl = e.code_expl,
     num_ilot  = i.num_ilot::text
 FROM travail.ilots i
 JOIN travail.exploitations e ON e.num = i.num_expl
 WHERE i.num_ilot_rpg = p.num_ilot_rpg;
- 
+
 WITH n AS (
   SELECT id_rpg,
          row_number() OVER (PARTITION BY code_expl, num_ilot ORDER BY surface DESC, id_rpg) AS num
@@ -299,13 +333,133 @@ UPDATE travail.parcelles p
 SET num_parcelle = n.num::text
 FROM n
 WHERE n.id_rpg = p.id_rpg;
- 
- 
+
+
+-- ---------------------------------------------------------------------
+-- 3. EXPLOITATIONS — NOMS ET COMMUNE DU SIÈGE
+-- Peut être relancée seule (sans refaire les étapes 0 à 2)
+-- ---------------------------------------------------------------------
+ALTER TABLE travail.exploitations
+	ADD COLUMN IF NOT EXISTS libelle    text,
+	ADD COLUMN IF NOT EXISTS commune    text,
+	ADD COLUMN IF NOT EXISTS code_insee text;
+
+UPDATE travail.exploitations SET libelle = NULL, commune = NULL, code_insee = NULL;
+
+
+-- 3a. Noms maison, tirés en premier, sans doublon
+WITH maison AS (
+  SELECT nom, row_number() OVER (ORDER BY random()) AS rang
+  FROM unnest(ARRAY[
+    'EARL Du Faux', 'GAEC Chez Moi', 'SCEA Les 2 Rivières', 'EARL Les Oeufs Frais',
+    'DOE Jane EI', 'DOE John EI', 'TOLKEN Danny EI', 'EARL Boucles de la Seine',
+    'GAEC La Ferme', 'GAEC Hameau', 'EARL Vache à Lait'
+  ]) AS nom
+),
+expl AS (
+  SELECT num, row_number() OVER (ORDER BY random()) AS rang
+  FROM travail.exploitations
+)
+UPDATE travail.exploitations e
+SET libelle = m.nom
+FROM expl x
+JOIN maison m USING (rang)
+WHERE e.num = x.num;
+
+
+-- 3b. Générateur pour les exploitations restantes
+-- · forme tirée : EARL 3 / GAEC 3 / SCEA 1 / EI 3
+-- · EARL, GAEC, SCEA : lieu-dit BD TOPO le plus proche de l'îlot de
+--   départ, non encore utilisé (« GAEC du Quesnay », « EARL de la
+--   Sablonnière »)
+-- · EI : NOM Prénom EI, sans doublon
+DO $$
+DECLARE
+  e      record;
+  forme  text;
+  t      text;
+  nom    text;
+  utilises text[] := '{}';                   -- lieux-dits déjà pris
+  noms   text[] := ARRAY['Lefebvre','Leroux','Duval','Lecomte','Hébert','Lemaire','Leclerc',
+                         'Lebrun','Dupont','Marie','Lecoq','Delamare','Lemonnier','Leblond',
+                         'Levasseur','Vasse','Lebas','Anquetil','Lecanu','Letellier','Hue',
+                         'Picard','Lesueur','Fauvel','Legrand','Duboc','Lemercier','Bourdon',
+                         'Morin','Hamel'];
+  prenoms text[] := ARRAY['Pierre','Marie','Thomas','Julie','Nicolas','Sophie','Antoine',
+                          'Camille','Julien','Émilie','Mathieu','Claire','Guillaume','Anne',
+                          'Laurent','Céline','Sébastien','Aurélie','François','Hélène'];
+BEGIN
+  FOR e IN
+    SELECT * FROM travail.exploitations WHERE libelle IS NULL ORDER BY random()
+  LOOP
+    forme := (ARRAY['EARL','EARL','EARL','GAEC','GAEC','GAEC','SCEA','EI','EI','EI'])
+             [1 + floor(random() * 10)::int];
+
+    IF forme <> 'EI' THEN
+      -- lieu-dit le plus proche dont le nom n'est pas déjà pris
+      SELECT l.toponyme INTO t
+      FROM referentiel.lieux_dits_import l
+      WHERE l.toponyme <> ALL (utilises)
+      ORDER BY l.geom <-> e.graine_geom
+      LIMIT 1;
+
+      IF t IS NULL THEN
+        forme := 'EI';                       -- plus de lieu-dit libre
+      ELSE
+        utilises := utilises || t;
+        nom := forme || ' ' ||
+          CASE
+            WHEN t ILIKE 'le %'  THEN 'du '    || substr(t, 4)
+            WHEN t ILIKE 'les %' THEN 'des '   || substr(t, 5)
+            WHEN t ILIKE 'la %'  THEN 'de la ' || substr(t, 4)
+            WHEN t ILIKE 'l''%'  THEN 'de l''' || substr(t, 3)
+            WHEN lower(left(t, 1)) IN ('a','e','é','è','i','o','u','y','h')
+                                 THEN 'd'''    || t
+            ELSE                      'de '    || t
+          END;
+      END IF;
+    END IF;
+
+    IF forme = 'EI' THEN
+      LOOP
+        nom := upper(noms[1 + floor(random() * array_length(noms, 1))::int]) || ' ' ||
+               prenoms[1 + floor(random() * array_length(prenoms, 1))::int] || ' EI';
+        EXIT WHEN NOT EXISTS (SELECT 1 FROM travail.exploitations WHERE libelle = nom);
+      END LOOP;
+    END IF;
+
+    UPDATE travail.exploitations SET libelle = nom WHERE num = e.num;
+  END LOOP;
+END $$;
+
+
+-- 3c. Commune du siège : commune où l'exploitation a la plus grande
+-- surface (point de chaque parcelle dans la commune)
+WITH s AS (
+  SELECT p.code_expl, c.code_insee, c.nom_officiel, sum(p.surface) AS ha
+  FROM travail.parcelles p
+  JOIN referentiel.communes_import c
+    ON ST_Within(ST_PointOnSurface(p.geom), c.geom)
+  WHERE p.code_expl IS NOT NULL
+  GROUP BY p.code_expl, c.code_insee, c.nom_officiel
+),
+siege AS (
+  SELECT DISTINCT ON (code_expl) *
+  FROM s
+  ORDER BY code_expl, ha DESC
+)
+UPDATE travail.exploitations e
+SET commune    = s.nom_officiel,
+    code_insee = s.code_insee
+FROM siege s
+WHERE s.code_expl = e.code_expl;
+
+
 -- ---------------------------------------------------------------------
 -- CONTRÔLES PROVISOIRES (iront dans 03_controles.sql)
 -- À lancer un par un : l'éditeur Supabase n'affiche que le dernier
 -- ---------------------------------------------------------------------
- 
+
 -- Étape 1 : chargement
 SELECT (SELECT count(*) FROM parcellaire.rpg_import)                 AS parcelles_rpg,
        (SELECT count(*) FROM travail.parcelles)                      AS parcelles_travail,
@@ -314,7 +468,7 @@ SELECT (SELECT count(*) FROM parcellaire.rpg_import)                 AS parcelle
        (SELECT count(*) FROM travail.parcelles
          WHERE culture = code_n)                                     AS cultures_sans_libelle,
        (SELECT round(sum(surface), 0) FROM travail.parcelles)        AS surface_ha;
- 
+
 -- Étape 2 : exploitations (cible / obtenue)
 SELECT e.code_expl,
        e.surface_cible,
@@ -325,7 +479,7 @@ FROM travail.exploitations e
 LEFT JOIN travail.ilots i ON i.num_expl = e.num
 GROUP BY e.num, e.code_expl, e.surface_cible, e.surface
 ORDER BY e.surface DESC;
- 
+
 -- Étape 2 : synthèse (min / moyenne / max, part du territoire)
 SELECT count(*)                  AS nb_exploitations,
        round(min(surface), 0)    AS min_ha,
@@ -334,3 +488,9 @@ SELECT count(*)                  AS nb_exploitations,
        round(sum(surface), 0)    AS total_ha,
        round(100 * sum(surface) / (SELECT sum(surface) FROM travail.parcelles), 0) AS pct_territoire
 FROM travail.exploitations;
+
+-- Étape 3 : noms et siège (doublons_libelle doit valoir 0)
+SELECT e.code_expl, e.libelle, e.commune, e.code_insee, e.surface,
+       count(*) OVER (PARTITION BY e.libelle) - 1 AS doublons_libelle
+FROM travail.exploitations e
+ORDER BY e.libelle;
