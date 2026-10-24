@@ -387,7 +387,7 @@ DECLARE
                          'Morin','Hamel'];
   prenoms text[] := ARRAY['Pierre','Marie','Thomas','Julie','Nicolas','Sophie','Antoine',
                           'Camille','Julien','Émilie','Mathieu','Claire','Guillaume','Anne',
-                          'Laurent','Céline','Sébastien','Aurélie','François','Hélène'];
+                          'Laurent','Céline','Joséphine','Aurélie','François','Hélène'];
 BEGIN
   FOR e IN
     SELECT * FROM travail.exploitations WHERE libelle IS NULL ORDER BY random()
@@ -456,6 +456,102 @@ WHERE s.code_expl = e.code_expl;
 
 
 -- ---------------------------------------------------------------------
+-- 4. LIBELLÉS DES PARCELLES
+-- Peut être relancée seule (sans refaire les étapes 0 à 3)
+-- · 4a : lieu-dit BD TOPO le plus proche (rayon_lieu_dit), utilisé une
+--   seule fois par exploitation → parcelle la plus proche du point
+-- · 4b : les autres parcelles reçoivent un nom généré à partir de deux
+--   séries (lieu-dit type + complément une fois sur deux), sans
+--   doublon dans l'exploitation
+-- ---------------------------------------------------------------------
+ALTER TABLE travail.param
+	ADD COLUMN IF NOT EXISTS rayon_lieu_dit int DEFAULT 500;   -- si param date d'avant l'étape 4
+ALTER TABLE travail.parcelles
+	ADD COLUMN IF NOT EXISTS source_libelle text;               -- 'lieu_dit' / 'genere'
+ 
+UPDATE travail.parcelles SET libelle = NULL, source_libelle = NULL;
+ 
+ 
+-- 4a. Lieux-dits réels (première lettre en majuscule : « le Quesnay » → « Le Quesnay »)
+WITH proche AS (
+  SELECT p.id_rpg, p.code_expl, l.toponyme, l.dist
+  FROM travail.parcelles p
+  CROSS JOIN LATERAL (
+    SELECT ld.toponyme, ST_Distance(ld.geom, p.geom) AS dist
+    FROM referentiel.lieux_dits_import ld
+    WHERE ST_DWithin(ld.geom, p.geom, (SELECT rayon_lieu_dit FROM travail.param))
+    ORDER BY ld.geom <-> p.geom
+    LIMIT 1
+  ) l
+  WHERE p.code_expl IS NOT NULL
+),
+choix AS (
+  SELECT DISTINCT ON (code_expl, toponyme) id_rpg, toponyme
+  FROM proche
+  ORDER BY code_expl, toponyme, dist, id_rpg
+)
+UPDATE travail.parcelles p
+SET libelle        = upper(left(c.toponyme, 1)) || substr(c.toponyme, 2),
+    source_libelle = 'lieu_dit'
+FROM choix c
+WHERE c.id_rpg = p.id_rpg;
+ 
+ 
+-- 4b. Noms générés (séries reprises du jeu de démo d'origine)
+-- · 50 % de noms simples, 50 % avec complément (tirage pondéré)
+-- · aucun nom déjà présent dans l'exploitation
+WITH serie1 AS (
+  SELECT unnest(ARRAY[
+    'La Noue','Les Ouches','La Lande','Le Pré Long','La Grande Pièce','Les Grandes Pièces',
+    'Le Champ Rond','La Croix','La Butte','Le Fief','Les Fiefs','La Bossardière','La Rivière',
+    'Le Marais','La Prée','Les Prés','Le Bois','La Garenne','La Mare','Les Terres Rouges',
+    'La Vigne','Les Vignes','Le Clos','Le Grand Clos','La Pâture','Les Pâtis','La Gâtine',
+    'Le Chêne','Les Chaumes','La Fosse','Le Moulin','La Métairie','La Borderie','La Coudre',
+    'L''Ouche','La Touche','La Cour','Le Puits','La Plaine','Les Rochettes','La Brosse',
+    'Le Plessis','La Vallée','Le Coteau','La Pièce Neuve','Le Champ Long','La Haie',
+    'Les Landes','La Barre','Le Pas']) AS s1
+),
+serie2 AS (
+  SELECT unnest(ARRAY[
+    'du Moulin','du Bourg','de la Croix','du Chêne','de la Mare','du Bois',
+    'de la Route','du Haut','du Bas','Nord','Sud','de l''Étang','des Saules',
+    'du Puits','de la Gare','du Calvaire','de la Fontaine','des Peupliers',
+    'de la Lande','du Château','des Noyers','de l''Église','de la Ferme',
+    'du Ruisseau','des Ormeaux']) AS s2
+),
+combos AS (
+  SELECT s1 AS nom, 0.5 / 50 AS poids FROM serie1
+  UNION ALL
+  SELECT s1 || ' ' || s2, 0.5 / 1250 FROM serie1 CROSS JOIN serie2
+),
+a_nommer AS (
+  SELECT id_rpg, code_expl,
+         row_number() OVER (PARTITION BY code_expl ORDER BY random()) AS rang
+  FROM travail.parcelles
+  WHERE code_expl IS NOT NULL
+    AND libelle IS NULL
+),
+tirage AS (
+  SELECT e.code_expl, c.nom,
+         row_number() OVER (PARTITION BY e.code_expl
+                            ORDER BY ln(1 - random()) / c.poids DESC) AS rang
+  FROM (SELECT DISTINCT code_expl FROM a_nommer) e
+  CROSS JOIN combos c
+  WHERE NOT EXISTS (
+    SELECT 1 FROM travail.parcelles p
+    WHERE p.code_expl = e.code_expl
+      AND p.libelle = c.nom
+  )
+)
+UPDATE travail.parcelles p
+SET libelle        = t.nom,
+    source_libelle = 'genere'
+FROM a_nommer a
+JOIN tirage t USING (code_expl, rang)
+WHERE p.id_rpg = a.id_rpg;
+ 
+
+-- ---------------------------------------------------------------------
 -- CONTRÔLES PROVISOIRES (iront dans 03_controles.sql)
 -- À lancer un par un : l'éditeur Supabase n'affiche que le dernier
 -- ---------------------------------------------------------------------
@@ -494,3 +590,23 @@ SELECT e.code_expl, e.libelle, e.commune, e.code_insee, e.surface,
        count(*) OVER (PARTITION BY e.libelle) - 1 AS doublons_libelle
 FROM travail.exploitations e
 ORDER BY e.libelle;
+
+-- Étape 4 : libellés par exploitation (sans_libelle et doublons doivent valoir 0)
+SELECT code_expl,
+       count(*)                                          AS nb_parcelles,
+       count(*) FILTER (WHERE source_libelle = 'lieu_dit') AS lieux_dits,
+       count(*) FILTER (WHERE source_libelle = 'genere')   AS generes,
+       count(*) FILTER (WHERE libelle IS NULL)             AS sans_libelle,
+       count(*) - count(DISTINCT libelle)                  AS doublons
+FROM travail.parcelles
+WHERE code_expl IS NOT NULL
+GROUP BY code_expl
+ORDER BY code_expl;
+ 
+-- Étape 4 : échantillon de 20 parcelles
+SELECT code_expl, num_ilot, num_parcelle, libelle, source_libelle, culture, surface
+FROM travail.parcelles
+WHERE code_expl IS NOT NULL
+ORDER BY random()
+LIMIT 20;
+ 
