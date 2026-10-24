@@ -28,7 +28,11 @@
 --   2. Exploitations : surfaces cibles, attribution des îlots,
 --      numérotation des îlots et des parcelles
 --   3. Exploitations : noms et commune du siège
---   … (étapes suivantes à venir)
+--   4. Libellés des parcelles (lieux-dits BD TOPO + générateur)
+--   5. Cultures N-1 / N-2 (rotations)
+--   6. Identifiants du logiciel de suivi parcellaire
+--   7. Dépôts et rattachement des exploitations
+--   8. Écriture dans les tables finales
 -- =====================================================================
 
 
@@ -48,6 +52,8 @@ SELECT 25   AS nb_exploitations,
        0.15 AS part_satellites,   -- part des îlots pris à distance (0 à 1)
        750  AS satellite_min,     -- m, distance mini au parcellaire
        3000 AS satellite_max,     -- m, distance maxi au parcellaire
+       -- libellés des parcelles (étape 4)
+       500  AS rayon_lieu_dit,    -- m, distance maxi parcelle → lieu-dit
        4    AS nb_depots,
        2026 AS campagne;          -- culture N = RPG 2025 (décalage assumé)
 
@@ -387,7 +393,7 @@ DECLARE
                          'Morin','Hamel'];
   prenoms text[] := ARRAY['Pierre','Marie','Thomas','Julie','Nicolas','Sophie','Antoine',
                           'Camille','Julien','Émilie','Mathieu','Claire','Guillaume','Anne',
-                          'Laurent','Céline','Joséphine','Aurélie','François','Hélène'];
+                          'Laurent','Céline','Sébastien','Aurélie','François','Hélène'];
 BEGIN
   FOR e IN
     SELECT * FROM travail.exploitations WHERE libelle IS NULL ORDER BY random()
@@ -468,10 +474,10 @@ ALTER TABLE travail.param
 	ADD COLUMN IF NOT EXISTS rayon_lieu_dit int DEFAULT 500;   -- si param date d'avant l'étape 4
 ALTER TABLE travail.parcelles
 	ADD COLUMN IF NOT EXISTS source_libelle text;               -- 'lieu_dit' / 'genere'
- 
+
 UPDATE travail.parcelles SET libelle = NULL, source_libelle = NULL;
- 
- 
+
+
 -- 4a. Lieux-dits réels (première lettre en majuscule : « le Quesnay » → « Le Quesnay »)
 WITH proche AS (
   SELECT p.id_rpg, p.code_expl, l.toponyme, l.dist
@@ -495,8 +501,8 @@ SET libelle        = upper(left(c.toponyme, 1)) || substr(c.toponyme, 2),
     source_libelle = 'lieu_dit'
 FROM choix c
 WHERE c.id_rpg = p.id_rpg;
- 
- 
+
+
 -- 4b. Noms générés (séries reprises du jeu de démo d'origine)
 -- · 50 % de noms simples, 50 % avec complément (tirage pondéré)
 -- · aucun nom déjà présent dans l'exploitation
@@ -549,7 +555,275 @@ SET libelle        = t.nom,
 FROM a_nommer a
 JOIN tirage t USING (code_expl, rang)
 WHERE p.id_rpg = a.id_rpg;
- 
+
+
+-- ---------------------------------------------------------------------
+-- 5. CULTURES N-1 / N-2 — rotations
+-- Peut être relancée seule (sans refaire les étapes 0 à 4)
+-- · culture N = culture déclarée au RPG (code_n)
+-- · le script cherche toutes les positions du code N dans les
+--   rotations, en tire une (pondérée par le poids de la rotation) ;
+--   N-1 et N-2 = cases précédentes du cycle
+-- · un code absent de toutes les rotations (prairie permanente,
+--   verger, bordure, jachère…) est reconduit : N-1 = N-2 = N
+-- ---------------------------------------------------------------------
+
+-- 5a. Table des rotations (codes RPG, dans l'ordre des années)
+-- · poids = surface estimée de la rotation sur le territoire (ha),
+--   déduite de la surface N de sa culture de tête ÷ sa fréquence dans
+--   le cycle (ex. pomme de terre 47 ha × 6 ans ≈ 280 ha). À ajuster
+--   pour un autre territoire.
+-- · une année d'une rotation pèse poids ÷ longueur du cycle : une
+--   parcelle en blé ne « remonte » vers une rotation rare (carottes,
+--   moutarde…) qu'en proportion de la place réelle de cette rotation.
+-- · les rotations qui partagent une case (luzerne / trèfle…) sont
+--   dupliquées.
+DROP TABLE IF EXISTS travail.rotations;
+CREATE TABLE travail.rotations (
+	rotation int PRIMARY KEY,
+	systeme  text    NOT NULL,
+	poids    numeric NOT NULL,     -- ha estimés
+	cycle    text[]  NOT NULL
+);
+
+INSERT INTO travail.rotations VALUES
+	( 1, 'Caux classique',                 1400, ARRAY['LIF','BTH','CZH','BTH']),
+	( 2, 'Lin / betterave',                 230, ARRAY['BTN','BTH','LIF','BTH']),
+	( 3, 'Pomme de terre',                  280, ARRAY['PTC','BTH','LIF','BTH','CZH','BTH']),
+	( 4, 'Maïs / blé (élevage)',            700, ARRAY['MIS','MIS','BTH','ORH']),
+	( 5, 'Prairie temporaire',               75, ARRAY['PTR','PTR','PTR','MIS','BTH']),
+	( 6, 'Luzerne',                           3, ARRAY['LUZ','LUZ','LUZ','MIS','BTH']),
+	( 7, 'Trèfle',                           40, ARRAY['TRE','TRE','TRE','MIS','BTH']),
+	( 8, 'Mélange légumineuses-graminées',   57, ARRAY['MLG','MLG','MLG','MIS','BTH']),
+	( 9, 'Mélange multi-espèces',             8, ARRAY['MLC','MLC','MLC','MIS','BTH']),
+	(10, 'Pois de printemps',               115, ARRAY['PPR','BTH','CZH','BTH','ORP']),
+	(11, 'Féverole de printemps',            25, ARRAY['FVP','BTH','CZH','BTH','ORP']),
+	(12, 'Féverole d''hiver',                72, ARRAY['FVL','BTH','CZH','BTH']),
+	(13, 'Tournesol',                        56, ARRAY['TRN','BTH','CZH','BTH']),
+	(14, 'Avoine de printemps',              12, ARRAY['AVP','BTH','LIF','BTH']),
+	(15, 'Avoine d''hiver',                  12, ARRAY['AVH','BTH','LIF','BTH']),
+	(16, 'Légumes de plein champ',            6, ARRAY['CAR','BTH','OIG','BTH','POR','ORP']),
+	(17, 'Moutarde',                          3, ARRAY['MOT','BTH','ORH']);
+
+
+-- 5b. Tirage de la position dans une rotation
+ALTER TABLE travail.parcelles
+	ADD COLUMN IF NOT EXISTS culture_n1 text,
+	ADD COLUMN IF NOT EXISTS culture_n2 text,
+	ADD COLUMN IF NOT EXISTS rotation   int;      -- NULL = culture reconduite
+
+UPDATE travail.parcelles
+SET code_n1 = NULL, code_n2 = NULL, culture_n1 = NULL, culture_n2 = NULL, rotation = NULL;
+
+WITH positions AS (
+  SELECT r.rotation, r.poids, r.cycle,
+         array_length(r.cycle, 1) AS n,
+         t.code, t.pos::int AS pos
+  FROM travail.rotations r
+  CROSS JOIN LATERAL unnest(r.cycle) WITH ORDINALITY AS t(code, pos)
+),
+tirage AS (
+  SELECT DISTINCT ON (p.id_rpg)
+         p.id_rpg, s.rotation, s.cycle, s.n, s.pos
+  FROM travail.parcelles p
+  JOIN positions s ON s.code = p.code_n
+  WHERE p.code_expl IS NOT NULL
+  ORDER BY p.id_rpg, ln(1 - random()) / (s.poids / s.n) DESC   -- poids d'une année du cycle
+)
+UPDATE travail.parcelles p
+SET rotation = t.rotation,
+    code_n1  = t.cycle[1 + (t.pos - 2 + t.n)     % t.n],
+    code_n2  = t.cycle[1 + (t.pos - 3 + 2 * t.n) % t.n]
+FROM tirage t
+WHERE p.id_rpg = t.id_rpg;
+
+-- 5c. Cultures hors rotation : reconduites à l'identique
+UPDATE travail.parcelles
+SET code_n1 = code_n,
+    code_n2 = code_n
+WHERE code_expl IS NOT NULL
+  AND code_n1 IS NULL;
+
+-- 5d. Libellés N-1 / N-2 (nomenclature, code brut si absent)
+UPDATE travail.parcelles p
+SET culture_n1 = coalesce(c1.libelle_culture, p.code_n1),
+    culture_n2 = coalesce(c2.libelle_culture, p.code_n2)
+FROM travail.parcelles q
+LEFT JOIN referentiel.cultures_rpg_import c1 ON c1.code_culture = q.code_n1
+LEFT JOIN referentiel.cultures_rpg_import c2 ON c2.code_culture = q.code_n2
+WHERE q.id_rpg = p.id_rpg
+  AND p.code_expl IS NOT NULL;
+
+
+-- ---------------------------------------------------------------------
+-- 6. ID_LOGICIEL_INTERNE — 'LOG' + 7 chiffres, à partir de 1048200,
+-- petits trous dans la numérotation (saut de 1 à 4), ordre
+-- exploitation / îlot / parcelle
+-- Peut être relancée seule
+-- ---------------------------------------------------------------------
+UPDATE travail.parcelles SET id_logiciel_interne = NULL;
+
+WITH pas AS (
+  SELECT id_rpg, code_expl, num_ilot::int AS ilot, num_parcelle::int AS parc,
+         1 + floor(random() * 4)::int AS saut
+  FROM travail.parcelles
+  WHERE code_expl IS NOT NULL
+),
+numeros AS (
+  SELECT id_rpg,
+         1048200 + sum(saut) OVER (ORDER BY code_expl, ilot, parc, id_rpg) AS n
+  FROM pas
+)
+UPDATE travail.parcelles p
+SET id_logiciel_interne = 'LOG' || lpad(n.n::text, 7, '0')
+FROM numeros n
+WHERE p.id_rpg = n.id_rpg;
+
+
+-- ---------------------------------------------------------------------
+-- 7. DÉPÔTS — sites physiques, puis rattachement des exploitations
+-- Peut être relancée seule
+-- · 7a : K-means sur les centres des parcellaires (k = nb_depots) ; le
+--   dépôt est posé au centre de chaque groupe, dans sa commune réelle
+-- · un seul dépôt par commune : si la commune est déjà prise, le dépôt
+--   passe dans la commune libre la plus proche (point posé dans
+--   celle-ci)
+-- · code_site 'SITE' + 3 chiffres (le groupe le plus gros d'abord),
+--   nom_site 'Site ' || commune
+-- · 7b : chaque exploitation est rattachée au dépôt le plus proche du
+--   centre de son parcellaire
+-- ---------------------------------------------------------------------
+ALTER TABLE travail.exploitations
+	ADD COLUMN IF NOT EXISTS centre public.geometry(point, 2154),
+	ADD COLUMN IF NOT EXISTS depot  text;
+
+UPDATE travail.exploitations e
+SET centre = c.geom
+FROM (
+  SELECT num_expl, ST_Centroid(ST_Collect(geom)) AS geom
+  FROM travail.ilots
+  WHERE num_expl IS NOT NULL
+  GROUP BY num_expl
+) c
+WHERE c.num_expl = e.num;
+
+DROP TABLE IF EXISTS travail.depots;
+CREATE TABLE travail.depots (
+	code_site text PRIMARY KEY,
+	nom_site  text NOT NULL,
+	insee     text NOT NULL,
+	commune   text NOT NULL,
+	nb_expl   int,
+	geom      public.geometry(point, 2154) NOT NULL
+);
+
+-- 7a. Position et commune des dépôts
+DO $$
+DECLARE
+  g      record;
+  c      record;
+  rang   int := 0;
+  pris   text[] := '{}';               -- communes déjà dotées d'un dépôt
+BEGIN
+  FOR g IN
+    WITH groupes AS (
+      SELECT centre,
+             ST_ClusterKMeans(centre, (SELECT nb_depots FROM travail.param)) OVER () AS k
+      FROM travail.exploitations
+    )
+    SELECT k, count(*) AS nb, ST_Centroid(ST_Collect(centre)) AS pt
+    FROM groupes
+    GROUP BY k
+    ORDER BY count(*) DESC, k
+  LOOP
+    rang := rang + 1;
+
+    -- commune qui contient le centre du groupe, sinon la plus proche ;
+    -- toujours parmi les communes encore libres
+    SELECT ci.code_insee, ci.nom_officiel, ci.geom,
+           ST_Contains(ci.geom, g.pt) AS contient
+    INTO c
+    FROM referentiel.communes_import ci
+    WHERE ci.code_insee <> ALL (pris)
+    ORDER BY ST_Contains(ci.geom, g.pt) DESC, ci.geom <-> g.pt
+    LIMIT 1;
+
+    pris := pris || c.code_insee;
+
+    INSERT INTO travail.depots (code_site, nom_site, insee, commune, nb_expl, geom)
+    VALUES ('SITE' || lpad(rang::text, 3, '0'),
+            'Site ' || c.nom_officiel,
+            c.code_insee,
+            c.nom_officiel,
+            g.nb,
+            CASE WHEN c.contient THEN g.pt ELSE ST_PointOnSurface(c.geom) END);
+  END LOOP;
+END $$;
+
+-- 7b. Dépôt le plus proche du centre de chaque parcellaire
+UPDATE travail.exploitations e
+SET depot = (
+  SELECT d.code_site
+  FROM travail.depots d
+  ORDER BY d.geom <-> e.centre
+  LIMIT 1
+);
+
+
+-- ---------------------------------------------------------------------
+-- 8. ÉCRITURE DANS LES TABLES FINALES
+-- À lancer quand le résultat du schéma travail est validé.
+-- · parcellaire.parcelles : la campagne de param est remplacée ; les
+--   autres campagnes ne sont pas touchées
+-- · exploitations et dépôts devenus orphelins (plus aucune parcelle ou
+--   exploitation) sont supprimés, puis les nouveaux insérés ou mis à
+--   jour (ON CONFLICT sur les codes)
+-- · si d'autres tables référencent ces lignes, une suppression peut
+--   être refusée par leurs clés étrangères : rien n'est alors écrit
+--   (transaction)
+-- ---------------------------------------------------------------------
+BEGIN;
+
+DELETE FROM parcellaire.parcelles
+WHERE campagne = (SELECT campagne FROM travail.param);
+
+DELETE FROM referentiel.exploitation e
+WHERE NOT EXISTS (SELECT 1 FROM parcellaire.parcelles p WHERE p.code_expl = e.code_expl)
+  AND NOT EXISTS (SELECT 1 FROM travail.exploitations t WHERE t.code_expl = e.code_expl);
+
+DELETE FROM referentiel.depots d
+WHERE NOT EXISTS (SELECT 1 FROM referentiel.exploitation e WHERE e.depot = d.code_site)
+  AND NOT EXISTS (SELECT 1 FROM travail.depots t WHERE t.code_site = d.code_site);
+
+INSERT INTO referentiel.depots (code_site, nom_site, insee, commune, geom)
+SELECT code_site, nom_site, insee, commune, geom
+FROM travail.depots
+ON CONFLICT (code_site) DO UPDATE
+SET nom_site = EXCLUDED.nom_site,
+    insee    = EXCLUDED.insee,
+    commune  = EXCLUDED.commune,
+    geom     = EXCLUDED.geom;
+
+INSERT INTO referentiel.exploitation (code_expl, libelle_exploitation, commune, code_insee, depot)
+SELECT code_expl, libelle, commune, code_insee, depot
+FROM travail.exploitations
+ON CONFLICT (code_expl) DO UPDATE
+SET libelle_exploitation = EXCLUDED.libelle_exploitation,
+    commune              = EXCLUDED.commune,
+    code_insee           = EXCLUDED.code_insee,
+    depot                = EXCLUDED.depot;
+
+INSERT INTO parcellaire.parcelles
+  (code_expl, campagne, num_ilot, num_parcelle, libelle, surface,
+   culture, culture_n1, culture_n2, geom, id_logiciel_interne, source_origine)
+SELECT p.code_expl, (SELECT campagne FROM travail.param), p.num_ilot, p.num_parcelle,
+       p.libelle, p.surface, p.culture, p.culture_n1, p.culture_n2, p.geom,
+       p.id_logiciel_interne, 'logiciel'
+FROM travail.parcelles p
+WHERE p.code_expl IS NOT NULL;
+
+COMMIT;
+
 
 -- ---------------------------------------------------------------------
 -- CONTRÔLES PROVISOIRES (iront dans 03_controles.sql)
@@ -602,11 +876,65 @@ FROM travail.parcelles
 WHERE code_expl IS NOT NULL
 GROUP BY code_expl
 ORDER BY code_expl;
- 
+
 -- Étape 4 : échantillon de 20 parcelles
 SELECT code_expl, num_ilot, num_parcelle, libelle, source_libelle, culture, surface
 FROM travail.parcelles
 WHERE code_expl IS NOT NULL
 ORDER BY random()
 LIMIT 20;
- 
+
+-- Étape 5 : assolement N / N-1 / N-2 (ha) — les trois colonnes doivent rester du même ordre de grandeur
+WITH codes AS (
+  SELECT code_n  AS code FROM travail.parcelles WHERE code_expl IS NOT NULL
+  UNION
+  SELECT code_n1 FROM travail.parcelles WHERE code_expl IS NOT NULL
+  UNION
+  SELECT code_n2 FROM travail.parcelles WHERE code_expl IS NOT NULL
+)
+SELECT c.code, coalesce(n.libelle_culture, c.code) AS culture,
+       coalesce(round(sum(p.surface) FILTER (WHERE p.code_n  = c.code)), 0) AS ha_n,
+       coalesce(round(sum(p.surface) FILTER (WHERE p.code_n1 = c.code)), 0) AS ha_n1,
+       coalesce(round(sum(p.surface) FILTER (WHERE p.code_n2 = c.code)), 0) AS ha_n2
+FROM codes c
+CROSS JOIN travail.parcelles p
+LEFT JOIN referentiel.cultures_rpg_import n ON n.code_culture = c.code
+WHERE p.code_expl IS NOT NULL
+GROUP BY c.code, n.libelle_culture
+ORDER BY ha_n DESC;
+
+-- Étape 5 : parcelles en rotation / reconduites, et vides (doit valoir 0)
+SELECT count(*) FILTER (WHERE rotation IS NOT NULL) AS en_rotation,
+       count(*) FILTER (WHERE rotation IS NULL)     AS reconduites,
+       count(*) FILTER (WHERE code_n1 IS NULL OR code_n2 IS NULL
+                           OR culture_n1 IS NULL OR culture_n2 IS NULL) AS vides
+FROM travail.parcelles
+WHERE code_expl IS NOT NULL;
+
+-- Étape 6 : identifiants (nb = nb_distincts, aucun vide)
+SELECT count(*) AS nb, count(DISTINCT id_logiciel_interne) AS nb_distincts,
+       count(*) FILTER (WHERE id_logiciel_interne IS NULL) AS vides,
+       min(id_logiciel_interne), max(id_logiciel_interne)
+FROM travail.parcelles
+WHERE code_expl IS NOT NULL;
+
+-- Étape 7 : dépôts (un par commune, toutes les exploitations rattachées)
+SELECT d.code_site, d.nom_site, d.insee,
+       count(e.*)                      AS nb_exploitations,
+       round(sum(e.surface))           AS ha,
+       (SELECT count(*) FROM travail.depots) = (SELECT count(DISTINCT insee) FROM travail.depots) AS un_par_commune,
+       (SELECT count(*) FROM travail.exploitations WHERE depot IS NULL) AS expl_sans_depot
+FROM travail.depots d
+LEFT JOIN travail.exploitations e ON e.depot = d.code_site
+GROUP BY d.code_site, d.nom_site, d.insee
+ORDER BY d.code_site;
+
+-- Étape 8 : tables finales (comparer avec le schéma travail)
+SELECT (SELECT count(*) FROM referentiel.depots)        AS depots,
+       (SELECT count(*) FROM referentiel.exploitation)  AS exploitations,
+       (SELECT count(*) FROM parcellaire.parcelles
+         WHERE campagne = (SELECT campagne FROM travail.param)) AS parcelles,
+       (SELECT round(sum(surface)) FROM parcellaire.parcelles
+         WHERE campagne = (SELECT campagne FROM travail.param)) AS surface_ha,
+       (SELECT count(*) FROM parcellaire.parcelles p
+         WHERE NOT EXISTS (SELECT 1 FROM referentiel.exploitation e WHERE e.code_expl = p.code_expl)) AS parcelles_orphelines;
